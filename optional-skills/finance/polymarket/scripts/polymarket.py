@@ -195,9 +195,29 @@ def cmd_book(token_id: str):
         print(f"    {_fmt_pct(a['price']):>7}  |  Size: {float(a['size']):>10.2f}")
 
 
+def _resolve_history_token(market_id: str) -> str:
+    """Resolve a market identifier to the CLOB token id /prices-history needs.
+
+    The endpoint keys on a token id, NOT a conditionId. A conditionId is
+    accepted here for convenience and resolved via Gamma to its Yes token.
+    """
+    if not market_id.startswith("0x"):
+        return market_id
+    markets = _get(f"{GAMMA}/markets?condition_ids={market_id}")
+    if not isinstance(markets, list) or not markets:
+        print(f"Could not resolve conditionId {market_id} to a token id.", file=sys.stderr)
+        return market_id
+    tokens = _parse_json_field(markets[0].get("clobTokenIds", "[]"))
+    if not isinstance(tokens, list) or not tokens:
+        print(f"Market {market_id} exposes no clobTokenIds.", file=sys.stderr)
+        return market_id
+    return tokens[0]
+
+
 def cmd_history(condition_id: str, interval: str = "all", fidelity: int = 50):
     """Get price history for a market."""
-    data = _get(f"{CLOB}/prices-history?market={condition_id}&interval={interval}&fidelity={fidelity}")
+    token_id = _resolve_history_token(condition_id)
+    data = _get(f"{CLOB}/prices-history?market={token_id}&interval={interval}&fidelity={fidelity}")
     history = data.get("history", [])
     if not history:
         print("No price history available for this market.")
