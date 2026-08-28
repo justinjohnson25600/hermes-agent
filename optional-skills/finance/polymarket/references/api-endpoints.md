@@ -139,11 +139,13 @@ Bids and asks are sorted by price. Size is in shares (USDC-denominated).
 ### Price History
 
 ```
-GET /prices-history?market=CONDITION_ID&interval=INTERVAL&fidelity=N
+GET /prices-history?market=TOKEN_ID&interval=INTERVAL&fidelity=N
 ```
 
 Parameters:
-- `market` — the conditionId (hex string with 0x prefix)
+- `market` — the **token id** from `clobTokenIds` (despite the parameter name).
+  Passing a conditionId returns `{"history": []}` with HTTP 200 — an empty
+  result that is indistinguishable from a market with no trading history.
 - `interval` — time range: `all`, `1d`, `1w`, `1m`, `3m`, `6m`, `1y`
 - `fidelity` — number of data points to return
 
@@ -216,5 +218,5 @@ To go from a Gamma market to CLOB data:
 
 1. Get market from Gamma: has `clobTokenIds` and `conditionId`
 2. Parse `clobTokenIds` (JSON string): `["YES_TOKEN", "NO_TOKEN"]`
-3. Use YES_TOKEN with `/price`, `/book`, `/midpoint`, `/spread`
-4. Use `conditionId` with `/prices-history` and Data API endpoints
+3. Use YES_TOKEN with `/price`, `/book`, `/midpoint`, `/spread`, `/prices-history`
+4. Use `conditionId` with the Data API endpoints

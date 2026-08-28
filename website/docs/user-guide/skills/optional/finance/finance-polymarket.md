@@ -49,7 +49,8 @@ See `references/api-endpoints.md` for the full endpoint reference with curl exam
 - Prices ARE probabilities: price 0.65 means the market thinks 65% likely
 - `outcomePrices` field: JSON-encoded array like `["0.80", "0.20"]`
 - `clobTokenIds` field: JSON-encoded array of two token IDs [Yes, No] for price/book queries
-- `conditionId` field: hex string used for price history queries
+- `conditionId` field: hex string identifying the market on-chain
+- Price history is keyed on a **token id**, not the conditionId
 - Volume is in USDC (US dollars)
 
 ## Three Public APIs
@@ -65,7 +66,7 @@ When a user asks about prediction market odds:
 1. **Search** using the Gamma API public-search endpoint with their query
 2. **Parse** the response — extract events and their nested markets
 3. **Present** market question, current prices as percentages, and volume
-4. **Deep dive** if asked — use clobTokenIds for orderbook, conditionId for history
+4. **Deep dive** if asked — use clobTokenIds for orderbook and for price history
 
 ## Presenting Results
 
