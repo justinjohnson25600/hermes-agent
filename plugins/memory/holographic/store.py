@@ -7,6 +7,7 @@ import os
 import re
 import sqlite3
 import threading
+from collections.abc import Iterable
 from pathlib import Path
 
 try:
@@ -79,6 +80,10 @@ CREATE TABLE IF NOT EXISTS memory_banks (
 # Trust adjustment constants
 _HELPFUL_DELTA   =  0.05
 _UNHELPFUL_DELTA = -0.10
+
+# Ids per UPDATE when counting retrievals. SQLITE_MAX_VARIABLE_NUMBER is 999
+# on builds predating 3.32, so stay well inside it.
+_RETRIEVAL_CHUNK = 500
 _TRUST_MIN       =  0.0
 _TRUST_MAX       =  1.0
 
@@ -279,15 +284,68 @@ class MemoryStore:
             results = [self._row_to_dict(r) for r in rows]
 
             if results:
-                ids = [r["fact_id"] for r in results]
-                placeholders = ",".join("?" * len(ids))
-                self._conn.execute(
-                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 WHERE fact_id IN ({placeholders})",
-                    ids,
-                )
-                self._conn.commit()
+                self._record_retrievals_locked([r["fact_id"] for r in results])
 
             return results
+
+    def record_retrievals(self, fact_ids: "Iterable[int]") -> int:
+        """Count facts as retrieved. Returns the number of distinct ids counted.
+
+        This is the single writer of ``retrieval_count``. It exists as its own
+        method because the counter must be incremented by whichever read path
+        actually hands facts to the agent, and there is more than one: the
+        per-turn ``<memory-context>`` prefetch, the ``fact_store`` search tool,
+        and the HRR probe/related/reason queries all reach the model, but only
+        ``search_facts`` used to touch the counter — and nothing called it.
+
+        ``retrieval_count`` is the only usage signal ``trust_score`` and
+        ``temporal_decay_half_life`` can learn from, so an uncounted read path
+        is a silently unlearning store rather than a visible failure.
+
+        Ids are de-duplicated, so one appearance in one result set counts once
+        however many times the caller repeats it. Unknown ids are ignored by
+        the WHERE clause rather than raising: a fact removed between the read
+        and the count is not an error worth failing a turn over.
+        """
+        unique: list[int] = []
+        seen: set[int] = set()
+        for raw in fact_ids:
+            try:
+                fid = int(raw)
+            except (TypeError, ValueError):
+                continue
+            if fid not in seen:
+                seen.add(fid)
+                unique.append(fid)
+
+        if not unique:
+            return 0
+
+        with self._lock:
+            self._record_retrievals_locked(unique)
+
+        return len(unique)
+
+    def _record_retrievals_locked(self, fact_ids: "list[int]") -> None:
+        """Increment ``retrieval_count``. Caller must hold ``self._lock``.
+
+        ``self._lock`` is re-entrant, so ``record_retrievals`` re-acquiring it
+        around this call is safe; the split exists so ``search_facts``, which
+        already holds the lock for its whole body, shares one implementation
+        rather than keeping a second copy of the SQL.
+        """
+        # Chunked to stay clear of SQLITE_MAX_VARIABLE_NUMBER, which is
+        # 999 on older builds. Result sets are normally small, but
+        # reason()/related() are not bounded by the same limit as search().
+        for start in range(0, len(fact_ids), _RETRIEVAL_CHUNK):
+            chunk = fact_ids[start:start + _RETRIEVAL_CHUNK]
+            placeholders = ",".join("?" * len(chunk))
+            self._conn.execute(
+                f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                f"WHERE fact_id IN ({placeholders})",
+                chunk,
+            )
+        self._conn.commit()
 
     def update_fact(
         self,

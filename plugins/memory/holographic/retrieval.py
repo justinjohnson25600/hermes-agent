@@ -6,6 +6,7 @@ Jaccard similarity reranking and trust-weighted scoring.
 
 from __future__ import annotations
 
+import logging
 import math
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -17,6 +18,8 @@ try:
     from . import holographic as hrr
 except ImportError:
     import holographic as hrr  # type: ignore[no-redef]
+
+logger = logging.getLogger(__name__)
 
 
 class FactRetriever:
@@ -119,6 +122,76 @@ class FactRetriever:
         # Strip raw HRR bytes — callers expect JSON-serializable dicts
         for fact in results:
             fact.pop("hrr_vector", None)
+        return self._record(results)
+
+    def _record(self, results: list[dict]) -> list[dict]:
+        """Count these facts as retrieved, then return them unchanged.
+
+        THE RULE: every method that *materialises its own result set* returns
+        through here — ``search``, the HRR bodies of ``probe``/``related``/
+        ``reason``, and ``_score_facts_by_vector``. Phrasing the invariant as
+        "every public method" is what let ``probe``'s category-bank branch
+        (which delegates to ``_score_facts_by_vector``) ship unrecorded in
+        review: it *is* a public path, but it is not where the rows are built.
+        Ownership of the result set, not public-ness, decides who counts.
+
+        The counter is recorded wherever facts actually reach the agent — the
+        per-turn ``<memory-context>`` prefetch included, which does most of
+        the work. ``retrieval_count`` is the only input ``trust_score`` and
+        ``temporal_decay_half_life`` can learn from; a read path that skips it
+        makes the store silently stop learning rather than fail visibly.
+
+        Conversely, a method that DELEGATES to another materialising method
+        (``probe``/``related``/``reason`` falling back to ``search`` when
+        numpy is absent) must NOT wrap the delegated call: the inner method
+        has already counted it, and counting twice would overstate exactly
+        the facts whose retrieval was least direct.
+
+        Bookkeeping never costs the caller its results. Recall is
+        load-bearing for the turn and statistics are not, so a failed count
+        is logged and swallowed.
+
+        On success the returned dicts are bumped to match. The rows were
+        SELECTed before the increment, so returning them untouched would
+        hand the caller a ``retrieval_count`` the database already
+        disagrees with — stale by exactly the retrieval that just happened,
+        which is the one a reader is most likely to be asking about. The
+        bump is skipped when the write raised, so the dicts never claim a
+        count that was not persisted.
+        """
+        if not results:
+            return results
+        try:
+            counted = self.store.record_retrievals(
+                f["fact_id"] for f in results if "fact_id" in f
+            )
+        except Exception as e:  # noqa: BLE001 - telemetry must never break recall
+            # WARNING, not debug: a permanently failing counter (locked db,
+            # dropped column) would otherwise be indistinguishable from a
+            # quiet store — the same silence-as-health this change removes.
+            logger.warning(
+                "Retrieval telemetry failed; recall unaffected, usage not "
+                "recorded: %s", e,
+            )
+            return results
+
+        if not counted:
+            return results
+
+        seen: set[int] = set()
+        for fact in results:
+            fid = fact.get("fact_id")
+            # int() to match record_retrievals' own coercion exactly, so the
+            # returned dicts can never disagree with what was persisted.
+            try:
+                fid = int(fid)  # type: ignore[arg-type]
+            except (TypeError, ValueError):
+                continue
+            if fid in seen:
+                continue
+            seen.add(fid)
+            if isinstance(fact.get("retrieval_count"), int):
+                fact["retrieval_count"] += 1
         return results
 
     def probe(
@@ -199,7 +272,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._record(scored[:limit])
 
     def related(
         self,
@@ -269,7 +342,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._record(scored[:limit])
 
     def reason(
         self,
@@ -347,7 +420,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._record(scored[:limit])
 
     def contradict(
         self,
@@ -490,7 +563,7 @@ class FactRetriever:
             scored.append(fact)
 
         scored.sort(key=lambda x: x["score"], reverse=True)
-        return scored[:limit]
+        return self._record(scored[:limit])
 
     def _fts_candidates(
         self,
