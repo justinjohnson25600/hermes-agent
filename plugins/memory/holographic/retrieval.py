@@ -178,20 +178,19 @@ class FactRetriever:
         if not counted:
             return results
 
-        seen: set[int] = set()
         for fact in results:
             fid = fact.get("fact_id")
-            # int() to match record_retrievals' own coercion exactly, so the
-            # returned dicts can never disagree with what was persisted.
+            # Normalise to match record_retrievals' integer-key mapping.
             try:
                 fid = int(fid)  # type: ignore[arg-type]
             except (TypeError, ValueError):
                 continue
-            if fid in seen:
-                continue
-            seen.add(fid)
-            if isinstance(fact.get("retrieval_count"), int):
-                fact["retrieval_count"] += 1
+            if fid in counted:
+                # Use the value read back after UPDATE, not a local +1:
+                # another writer may have changed the counter, or the row may
+                # have disappeared before the update and therefore not be in
+                # the mapping at all.
+                fact["retrieval_count"] = counted[fid]
         return results
 
     def probe(

@@ -284,12 +284,18 @@ class MemoryStore:
             results = [self._row_to_dict(r) for r in rows]
 
             if results:
-                self._record_retrievals_locked([r["fact_id"] for r in results])
+                counted = self._record_retrievals_locked(
+                    [r["fact_id"] for r in results]
+                )
+                for result in results:
+                    fact_id = result["fact_id"]
+                    if fact_id in counted:
+                        result["retrieval_count"] = counted[fact_id]
 
             return results
 
-    def record_retrievals(self, fact_ids: "Iterable[int]") -> int:
-        """Count facts as retrieved. Returns the number of distinct ids counted.
+    def record_retrievals(self, fact_ids: "Iterable[int]") -> dict[int, int]:
+        """Increment usage counters and return the persisted counts.
 
         This is the single writer of ``retrieval_count``. It exists as its own
         method because the counter must be incremented by whichever read path
@@ -298,14 +304,13 @@ class MemoryStore:
         and the HRR probe/related/reason queries all reach the model, but only
         ``search_facts`` used to touch the counter — and nothing called it.
 
-        ``retrieval_count`` is the only usage signal ``trust_score`` and
-        ``temporal_decay_half_life`` can learn from, so an uncounted read path
-        is a silently unlearning store rather than a visible failure.
-
-        Ids are de-duplicated, so one appearance in one result set counts once
-        however many times the caller repeats it. Unknown ids are ignored by
-        the WHERE clause rather than raising: a fact removed between the read
-        and the count is not an error worth failing a turn over.
+        The returned mapping contains only ids whose UPDATE matched a row, with
+        each row's resulting persisted count. A fact removed before the write
+        is therefore omitted rather than being reported as counted. Ids are
+        de-duplicated first, so one appearance in one result set counts once
+        however many times the caller repeats it. Unknown or non-integer ids
+        are ignored rather than raising: a fact removed between the read and
+        the count is not an error worth failing a turn over.
         """
         unique: list[int] = []
         seen: set[int] = set()
@@ -319,33 +324,54 @@ class MemoryStore:
                 unique.append(fid)
 
         if not unique:
-            return 0
+            return {}
 
         with self._lock:
-            self._record_retrievals_locked(unique)
+            return self._record_retrievals_locked(unique)
 
-        return len(unique)
+    def _record_retrievals_locked(self, fact_ids: "list[int]") -> dict[int, int]:
+        """Increment counters and return matched ids with persisted counts.
 
-    def _record_retrievals_locked(self, fact_ids: "list[int]") -> None:
-        """Increment ``retrieval_count``. Caller must hold ``self._lock``.
-
-        ``self._lock`` is re-entrant, so ``record_retrievals`` re-acquiring it
-        around this call is safe; the split exists so ``search_facts``, which
-        already holds the lock for its whole body, shares one implementation
-        rather than keeping a second copy of the SQL.
+        Caller must hold ``self._lock``. The explicit transaction makes a
+        multi-chunk update all-or-nothing and holds SQLite's writer lock while
+        the post-update SELECT observes which rows actually matched. This
+        prevents a concurrent delete from making the caller claim a count that
+        was never persisted.
         """
-        # Chunked to stay clear of SQLITE_MAX_VARIABLE_NUMBER, which is
-        # 999 on older builds. Result sets are normally small, but
-        # reason()/related() are not bounded by the same limit as search().
-        for start in range(0, len(fact_ids), _RETRIEVAL_CHUNK):
-            chunk = fact_ids[start:start + _RETRIEVAL_CHUNK]
-            placeholders = ",".join("?" * len(chunk))
-            self._conn.execute(
-                f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
-                f"WHERE fact_id IN ({placeholders})",
-                chunk,
-            )
-        self._conn.commit()
+        if not fact_ids:
+            return {}
+
+        counted: dict[int, int] = {}
+        self._conn.execute("BEGIN IMMEDIATE")
+        try:
+            # Chunked to stay clear of SQLITE_MAX_VARIABLE_NUMBER, which is
+            # 999 on older builds. Result sets are normally small, but
+            # reason()/related() are not bounded by the same limit as search().
+            for start in range(0, len(fact_ids), _RETRIEVAL_CHUNK):
+                chunk = fact_ids[start:start + _RETRIEVAL_CHUNK]
+                placeholders = ",".join("?" * len(chunk))
+                cursor = self._conn.execute(
+                    f"UPDATE facts SET retrieval_count = retrieval_count + 1 "
+                    f"WHERE fact_id IN ({placeholders})",
+                    chunk,
+                )
+                if cursor.rowcount == 0:
+                    continue
+                rows = self._conn.execute(
+                    f"SELECT fact_id, retrieval_count FROM facts "
+                    f"WHERE fact_id IN ({placeholders})",
+                    chunk,
+                ).fetchall()
+                counted.update(
+                    {int(row["fact_id"]): int(row["retrieval_count"])
+                     for row in rows}
+                )
+            self._conn.commit()
+        except Exception:
+            self._conn.rollback()
+            raise
+
+        return counted
 
     def update_fact(
         self,

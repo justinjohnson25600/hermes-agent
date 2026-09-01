@@ -21,10 +21,12 @@ from __future__ import annotations
 
 import pytest
 
-pytest.importorskip("numpy")  # retrieval module imports numpy indirectly
-
 from plugins.memory.holographic.retrieval import FactRetriever
 from plugins.memory.holographic.store import MemoryStore
+
+# Do not skip this module when NumPy is absent: the no-NumPy delegation path
+# is itself a telemetry contract. Vector-only coverage lives in the broader
+# retrieval test module, which may skip those cases independently.
 
 
 @pytest.fixture
@@ -123,6 +125,37 @@ def test_empty_result_records_nothing(store):
     assert FactRetriever(store=store).search("zzzznonexistenttoken") == []
 
     assert _counts(store) == before
+
+
+def test_record_retrievals_reports_only_persisted_rows(seeded):
+    """The writer reports matched ids and their actual persisted counts."""
+    store, ids = seeded
+    valid = ids["rollback"]
+
+    counted = store.record_retrievals([valid, str(valid), valid, 999_999_999])
+
+    assert counted == {valid: 1}
+    assert _counts(store)[valid] == 1
+
+
+def test_record_retrievals_chunks_large_id_sets(store):
+    """Large batches stay below SQLite's variable limit without losing ids."""
+    # The counter method does not need vectors or FTS rows, so insert the
+    # minimal fact records directly to keep this boundary test fast.
+    with store._lock:
+        store._conn.executemany(
+            "INSERT INTO facts (content, category) VALUES (?, ?)",
+            [(f"bulk telemetry fact {i}", "general") for i in range(501)],
+        )
+        store._conn.commit()
+    ids = [row[0] for row in store._conn.execute(
+        "SELECT fact_id FROM facts WHERE content LIKE 'bulk telemetry fact %'"
+    ).fetchall()]
+
+    counted = store.record_retrievals(ids)
+
+    assert set(counted) == set(ids)
+    assert all(count == 1 for count in counted.values())
 
 
 def test_repeated_retrieval_accumulates(seeded):
