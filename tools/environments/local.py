@@ -789,6 +789,16 @@ class LocalEnvironment(BaseEnvironment):
             stdin=subprocess.PIPE if stdin_data is not None else subprocess.DEVNULL,
             start_new_session=True, cwd=self.cwd,
             **({"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}))
+        if _IS_WINDOWS:
+            # Commit cap (win_job_cap): a runaway allocator among this
+            # process's descendants must die alone, not take the host down
+            # (2026-09-06: a 45 GB test-suite allocation froze the machine).
+            try:
+                from tools.environments.win_job_cap import assign_to_job
+
+                assign_to_job(proc)
+            except Exception:
+                logger.debug("job cap assignment skipped", exc_info=True)
         if not _IS_WINDOWS:
             with contextlib.suppress(ProcessLookupError):
                 proc._hermes_pgid = os.getpgid(proc.pid)
