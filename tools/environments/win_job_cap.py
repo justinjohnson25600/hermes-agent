@@ -103,6 +103,7 @@ if _IS_WINDOWS:
     _kernel32.CloseHandle.restype = wintypes.BOOL
 
     _PROCESS_SET_QUOTA = 0x0100
+    _PROCESS_TERMINATE = 0x0001
 
 _job_handle = None
 _job_lock = threading.Lock()
@@ -158,7 +159,8 @@ def assign_to_job(proc) -> None:
     job = _get_job()
     if job is None:
         return
-    handle = _kernel32.OpenProcess(_PROCESS_SET_QUOTA, False, proc.pid)
+    handle = _kernel32.OpenProcess(
+        _PROCESS_SET_QUOTA | _PROCESS_TERMINATE, False, proc.pid)
     if not handle:
         logger.debug("job cap: OpenProcess(%d) failed: %s", proc.pid,
                      ctypes.WinError(ctypes.get_last_error()))
