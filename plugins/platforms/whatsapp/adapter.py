@@ -213,9 +213,17 @@ def _file_content_hash(path: Path) -> str:
 
 def check_whatsapp_requirements() -> bool:
     """Node.js (Hermes-managed first, so a bad system Node on PATH can't break Windows) is available."""
+    # 2026-09-17: the node --version probe MUST carry hidden-console flags - a console
+    # exe from a windowless parent (dashboard/observer polling platform status) flashes
+    # a Windows Terminal window over Justin's work (28 Aug + 17 Sep incidents; upstream
+    # 2ecca1e7d3: "capture is not a no-window boundary"). 2026-09-18: 4th recurrence
+    # after update wiped commit 685a211d06 - now also carried as a versioned overlay patch.
+    from hermes_cli._subprocess_compat import windows_hide_flags
     _node = find_node_executable("node")
     try:
-        return bool(_node) and subprocess.run([_node, "--version"], timeout=5, **_RUN_TEXT).returncode == 0
+        return bool(_node) and subprocess.run(
+            [_node, "--version"], timeout=5,
+            creationflags=windows_hide_flags(), **_RUN_TEXT).returncode == 0
     except Exception:
         return False
 
