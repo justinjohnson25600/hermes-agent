@@ -21,7 +21,7 @@ import tempfile
 import time as _time_mod
 
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, NamedTuple, Optional
 from hermes_cli.desktop_console import desktop_console_output, desktop_launch_notice
 from hermes_platform.host import facts
 
@@ -527,13 +527,18 @@ def _stop_desktop_processes_locking_build(desktop_dir: Path, *, also_posix: bool
         if release_dir in exe_path.parents:
             victims.append(proc)
 
+    victim_pids = {int(proc.pid) for proc in victims}
     stopped: list[int] = []
     for proc in victims:
+        # Read the relaunch recipe while the process still exists.
+        launch = _stopped_desktop_launch(proc, victim_pids)
         try:
             proc.terminate()
             stopped.append(int(proc.pid))
         except Exception:
             continue
+        if launch is not None and launch not in _stopped_desktop_launches:
+            _stopped_desktop_launches.append(launch)
     if stopped:
         # Wait for the handles (and thus the file locks) to actually release.
         with contextlib.suppress(Exception):
@@ -548,6 +553,125 @@ def _stop_desktop_processes_locking_build(desktop_dir: Path, *, also_posix: bool
             if killed:
                 psutil.wait_procs(killed, timeout=5)
     return stopped
+
+
+class _StoppedDesktop(NamedTuple):
+    """How to reopen a Desktop main process this process stopped, as it was launched: its
+    exact argv, working directory and environment (None when unreadable), and the Windows
+    session it ran in (None when unknown or off Windows)."""
+    argv: tuple[str, ...]
+    session_id: Optional[int]
+    cwd: Optional[str] = None
+    env: Optional[tuple[tuple[str, str], ...]] = None
+
+
+# Every Desktop window this process closed to free the build output. The Desktop's own
+# update hand-off (scripts/desktop-update) reopens the app it quit, but an update run from
+# a terminal, a scheduled task or a fleet orchestrator has no such owner: without this
+# record the user's window stayed closed until they noticed and reopened it by hand.
+_stopped_desktop_launches: list[_StoppedDesktop] = []
+
+# The update's completion interpreter is activated (pm.environments.activation_environment);
+# a Desktop started with that environment hands it to the backend it spawns.
+_UPDATE_ACTIVATION_ENV = ("PYTHONPATH", "PYTHONHOME", "VIRTUAL_ENV")
+
+
+def _desktop_relaunch_env(desktop: "_StoppedDesktop") -> dict[str, str]:
+    """The stopped Desktop's own environment (an Explorer launch's), else this process's
+    minus the update interpreter's activation."""
+    if desktop.env is not None:
+        return dict(desktop.env)
+    return {key: value for key, value in os.environ.items()
+            if key.upper() not in _UPDATE_ACTIVATION_ENV and not key.startswith("__HERMES")}
+
+
+def _windows_session_id(pid: int) -> Optional[int]:
+    """Windows session a pid runs in, or None (non-Windows, gone, or unreadable). Never raises."""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        session = wintypes.DWORD()
+        if ctypes.windll.kernel32.ProcessIdToSessionId(wintypes.DWORD(pid), ctypes.byref(session)):
+            return int(session.value)
+    except Exception:
+        pass
+    return None
+
+
+def _stopped_desktop_launch(proc, victim_pids: set[int]) -> Optional[_StoppedDesktop]:
+    """Relaunch recipe for a Desktop MAIN process; None for Electron's helpers (renderer,
+    GPU, utility — children of another victim, ``--type=`` on argv) or an unreadable one."""
+    try:
+        argv = tuple(str(arg) for arg in proc.cmdline())
+        parent = int(proc.ppid())
+    except Exception:
+        return None
+    if not argv or parent in victim_pids or any(arg.startswith("--type=") for arg in argv[1:]):
+        return None
+    cwd = env = None
+    with contextlib.suppress(Exception):
+        cwd = str(proc.cwd())
+    with contextlib.suppress(Exception):
+        env = tuple(sorted((str(k), str(v)) for k, v in proc.environ().items()))
+    return _StoppedDesktop(argv, _windows_session_id(int(proc.pid)), cwd, env)
+
+
+def _spawn_detached_desktop(argv: list[str], *, cwd: Path, env: Optional[dict] = None) -> "subprocess.Popen":
+    """Start a packaged Windows Desktop detached from this console, process group and job
+    (#58275), so it outlives the shell or scheduled task that launched it. A job that
+    forbids breakaway (ERROR_ACCESS_DENIED) retries without it; every other spawn failure
+    raises."""
+    from hermes_cli._subprocess_compat import windows_detach_flags, windows_detach_flags_without_breakaway
+
+    popen_kwargs = dict(cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL, close_fds=True)
+    try:
+        return subprocess.Popen(argv, creationflags=windows_detach_flags(), **popen_kwargs)
+    except OSError as exc:
+        if getattr(exc, "winerror", None) != 5:
+            raise
+        return subprocess.Popen(argv, creationflags=windows_detach_flags_without_breakaway(), **popen_kwargs)
+
+
+def relaunch_desktops_stopped_for_update() -> list[int]:
+    """Reopen each Desktop window this process stopped to free its build output, once.
+
+    Run when the update's desktop build is over, built or not (a failed pack keeps the
+    previous app at the same path). The reopened app waits on the update marker before
+    starting its backend, so it comes up on the new code. Windows only: the pack-time
+    stop is unconditional there; elsewhere the swap-time stop is reported instead.
+    A Desktop from another Windows session (an update driven over SSH) is not reopened
+    here — that would start an invisible app holding the single-instance lock.
+    Returns the new pids. Never raises."""
+    pending = list(dict.fromkeys(_stopped_desktop_launches))
+    _stopped_desktop_launches.clear()
+    reopened: list[int] = []
+    for desktop in pending:
+        exe = Path(desktop.argv[0])
+        if sys.platform != "win32":
+            print("  ⚠ Hermes Desktop was closed to install the update — reopen it to continue.")
+            continue
+        here = _windows_session_id(os.getpid())
+        if desktop.session_id is None or desktop.session_id != here:
+            print(f"  ⚠ Hermes Desktop was closed to install the update; it ran in another Windows "
+                  f"session ({desktop.session_id}, this update is in {here}) — reopen it there.")
+            continue
+        if not exe.is_file():
+            print(f"  ⚠ Hermes Desktop was closed to install the update, but {exe} is missing — "
+                  "reopen it from the Start menu.")
+            continue
+        try:
+            cwd = Path(desktop.cwd) if desktop.cwd and Path(desktop.cwd).is_dir() else exe.parent
+            pid = _spawn_detached_desktop(list(desktop.argv), cwd=cwd, env=_desktop_relaunch_env(desktop)).pid
+        except Exception as exc:
+            print(f"  ⚠ Could not reopen Hermes Desktop ({exc}) — reopen it from the Start menu.")
+            continue
+        logger.info("reopened desktop stopped for the update build: pid %s argv %s", pid, desktop.argv)
+        print(f"  ✓ Reopened Hermes Desktop (pid {pid}); it connects once the update finishes")
+        reopened.append(pid)
+    return reopened
 
 
 def _desktop_macos_bundle_id(bundle: Path) -> Optional[str]:
@@ -1945,34 +2069,7 @@ def cmd_gui(args: argparse.Namespace):
         # macOS/Linux keep the foreground run below: those launches are
         # expected to stay attached to the terminal, and the desktop_console
         # drain is a Windows-only concern.
-        from hermes_cli._subprocess_compat import (
-            windows_detach_flags,
-            windows_detach_flags_without_breakaway,
-        )
-
-        popen_kwargs = dict(
-            cwd=desktop_dir,
-            env=env,
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-        )
-        try:
-            subprocess.Popen(launch_command, creationflags=windows_detach_flags(), **popen_kwargs)
-        except OSError as exc:
-            # Only recover from a denied job breakaway (the parent's job object
-            # lacks JOB_OBJECT_LIMIT_BREAKAWAY_OK), which surfaces as
-            # ERROR_ACCESS_DENIED (winerror == 5). Re-raise every other spawn
-            # failure (bad argv/env, missing exe) so it stays a clear, single
-            # error instead of being masked by a doomed second attempt.
-            if getattr(exc, "winerror", None) != 5:
-                raise
-            subprocess.Popen(
-                launch_command,
-                creationflags=windows_detach_flags_without_breakaway(),
-                **popen_kwargs,
-            )
+        _spawn_detached_desktop(launch_command, cwd=desktop_dir, env=env)
         if deferred_entry is not None:
             deferred_entry.finish()
         desktop_launch_notice("✓ Hermes Desktop launched in a detached window; you can close this shell.")
