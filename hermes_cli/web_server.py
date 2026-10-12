@@ -488,7 +488,17 @@ def _require_token(request: Request) -> None:
     ``gated_auth_middleware`` already 401'd anything without a verified
     ``request.state.session`` — requiring the absent token here would make every
     ``_require_token`` endpoint unreachable behind the gate, so defer to it.
+
+    Both branches also accept a request the token-auth seam already
+    authenticated (``request.state.token_authenticated``): the seam runs
+    outermost, verifies the bearer against the registered token providers
+    (fail-closed), and every auth layer above this helper honours the flag.
+    This is the machine path the host rendezvous record's 0600 token is
+    published for: ``probe_owner`` dials ``/api/host/identity`` with it even on
+    a gated backend.
     """
+    if getattr(request.state, "token_authenticated", False):
+        return
     if getattr(request.app.state, "auth_required", False):
         ok = getattr(request.state, "session", None) is not None
     else:
