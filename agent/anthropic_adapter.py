@@ -71,7 +71,12 @@ def _require_sdk(purpose: str, verb: str = "Install it with"):
 
 logger = logging.getLogger(__name__)
 
-THINKING_BUDGET = {"xhigh": 32000, "high": 16000, "medium": 8000, "low": 4000}
+# Manual-thinking routes have no native max/ultra effort: use the largest
+# supported budget instead of silently falling back to medium (8000).
+THINKING_BUDGET = {
+    "ultra": 32000, "max": 32000, "xhigh": 32000,
+    "high": 16000, "medium": 8000, "low": 4000,
+}
 # Hermes effort -> Anthropic adaptive-thinking effort (output_config.effort). 4.7+ exposes
 # low/medium/high/xhigh/max; Opus/Sonnet 4.6 have no xhigh, so callers downgrade xhigh->max
 # there (see _supports_xhigh_effort). "minimal" is a legacy alias for low on every model.
